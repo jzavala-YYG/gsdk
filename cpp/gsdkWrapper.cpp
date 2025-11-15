@@ -294,3 +294,87 @@ GSDKWRAP_API const char* gsdk_get_initial_player(double index)
         return nullptr;
     }
 }
+
+
+// ----------------- update connected players -----------------
+//
+// idsCsv:
+//   - nullptr or ""  -> clears all connected players
+//   - "p1"           -> one player
+//   - "p1,p2,p3"     -> multiple players
+//
+GSDKWRAP_API double gsdk_update_connected_players(const char* idsCsv)
+{
+    try
+    {
+        std::vector<ConnectedPlayer> players;
+
+        if (idsCsv && idsCsv[0] != '\0')
+        {
+            std::string all(idsCsv);
+            std::stringstream ss(all);
+            std::string token;
+
+            while (std::getline(ss, token, ','))
+            {
+                // remove simple spaces around id
+                size_t start = token.find_first_not_of(" \t\r\n");
+                size_t end   = token.find_last_not_of(" \t\r\n");
+                if (start == std::string::npos || end == std::string::npos)
+                    continue;
+
+                std::string id = token.substr(start, end - start + 1);
+                if (!id.empty())
+                {
+                    players.emplace_back(id); // ConnectedPlayer(std::string)
+                }
+            }
+        }
+
+        GSDK::updateConnectedPlayers(players);
+        std::cout << "gsdk_update_connected_players: count=" << players.size() << std::endl;
+
+        return static_cast<double>(players.size());
+    }
+    catch (const std::exception& ex)
+    {
+        std::cout << "Exception in gsdk_update_connected_players: " << ex.what() << std::endl;
+        return -1.0;
+    }
+    catch (...)
+    {
+        std::cout << "Unknown exception in gsdk_update_connected_players" << std::endl;
+        return -2.0;
+    }
+}
+
+
+
+GSDKWRAP_API double gsdk_end_session()
+{
+    try
+    {
+        std::cout << "gsdk_end_session CALLED" << std::endl;
+
+        // Clear connected players
+        std::vector<ConnectedPlayer> emptyList;
+        GSDK::updateConnectedPlayers(emptyList);
+
+        // Mark unhealthy so health callback starts failing
+        g_healthy = false;
+
+        std::cout << "gsdk_end_session: cleared players and marked unhealthy" << std::endl;
+        return 1.0;
+    }
+    catch (const std::exception& ex)
+    {
+        std::cout << "Exception in gsdk_end_session: " << ex.what() << std::endl;
+        return -1.0;
+    }
+    catch (...)
+    {
+        std::cout << "Unknown exception in gsdk_end_session" << std::endl;
+        return -2.0;
+    }
+}
+
