@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.2)
+cmake_minimum_required(VERSION 3.5)
 project(GSDK_CPP)
 
 # if no build type specified, default to Debug
@@ -6,38 +6,47 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
 endif()
 
-# if we're building for Windows, use the included CURL lib
+# ---- CURL paths (Windows only) ----
 if(WIN32)
-    # TODO: handle something that isn't Debug/Release when pathing this out
-    set(CURL_LIBRARY     "dependencies/libcurl-vc15-x64-${CMAKE_BUILD_TYPE}-dll-ssl-dll-ipv6-sspi/lib/")
-    set(CURL_INCLUDE_DIR "dependencies/libcurl-vc15-x64-${CMAKE_BUILD_TYPE}-dll-ssl-dll-ipv6-sspi/include/")
+    set(CURL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/libcurl-vc15-x64-Release-dll-ssl-dll-ipv6-sspi")
+    set(CURL_INCLUDE_DIR "${CURL_ROOT}/include")
+    # use the actual file name in the lib folder:
+    set(CURL_LIBRARY "${CURL_ROOT}/lib/libcurl.lib")
 endif()
 
-# if we're Windows, the above handles the requirement
-# if we're Linux, install libcurl via package manager or vcpkg
-find_package(CURL REQUIRED)
-
-add_library(GSDK_CPP
+# ---- One SHARED library (DLL) that contains GSDK + your wrapper ----
+add_library(GSDK_CPP SHARED
     "cppsdk/gsdk.cpp"
     "cppsdk/gsdkConfig.cpp"
     "cppsdk/gsdkLog.cpp"
     "cppsdk/gsdkUtils.cpp"
     "cppsdk/jsoncpp.cpp"
     "cppsdk/ManualResetEvent.cpp"
+    "gsdkWrapper.cpp"
 )
 
 target_include_directories(GSDK_CPP PRIVATE
     cppsdk
-    cppsdk/include)
+    cppsdk/include
+    ${CURL_INCLUDE_DIR}
+)
 
-set_target_properties(GSDK_CPP PROPERTIES CXX_STANDARD 14)
+target_link_libraries(GSDK_CPP PRIVATE
+    ${CURL_LIBRARY}
+)
 
-# set output names and other flags
+set_target_properties(GSDK_CPP PROPERTIES
+    CXX_STANDARD 14
+)
+
 if(UNIX)
     set_target_properties(GSDK_CPP PROPERTIES OUTPUT_NAME "GSDK_CPP_Linux")
     target_compile_options(GSDK_CPP PRIVATE -DGSDK_LINUX)
 elseif(WIN32)
-    set_target_properties(GSDK_CPP PROPERTIES OUTPUT_NAME "GSDK_CPP_Windows")
-    target_include_directories(GSDK_CPP PRIVATE "dependencies/libcurl-vc15-x64-${CMAKE_BUILD_TYPE}-dll-ssl-dll-ipv6-sspi/include/")
+    # Final DLL name: PlayFabGsdkWrapper.dll
+    set_target_properties(GSDK_CPP PROPERTIES OUTPUT_NAME "PlayFabGsdkWrapper")
     target_compile_options(GSDK_CPP PRIVATE -DGSDK_WINDOWS)
 endif()
+
+
+
