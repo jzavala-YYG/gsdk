@@ -6,27 +6,38 @@
 #include <Windows.h>
 #endif
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <sstream>
 #include <vector>
 #include <iostream>
 #include <cstring>
+#include <deque>
+#include <ctime>
+#include <cstdio>
 
 #include "gsdk.h"  // from cppsdk/include
 
 using namespace Microsoft::Azure::Gaming;
 
 static std::mutex   g_mutex;
-static std::string  g_lastString;       // last normal return (for debugging only)
-static std::string  g_lastErrorString;  // last error message (human readable)
+static std::string  g_lastString;
+static std::string  g_lastErrorString;
 
-// C-style buffers exposed to GameMaker
+// return buffers exposed to GameMaker
 static char g_lastReturnBuffer[4096] = { 0 };
 static char g_lastErrorBuffer[4096]  = { 0 };
 
-static bool         g_started = false;
-static bool         g_healthy = true;
+// lifecycle flags
+static std::atomic<bool> g_started{ false };
+static std::atomic<bool> g_healthy{ true };
+static std::atomic<bool> g_shutdownRequested{ false };
+
+// event queue
+static std::mutex g_eventsMutex;
+static std::deque<std::string> g_events;
+static const size_t GSDK_MAX_EVENTS = 256;
 
 #ifdef _WIN32
     #define GSDKWRAP_API extern "C" __declspec(dllexport)
@@ -34,7 +45,9 @@ static bool         g_healthy = true;
     #define GSDKWRAP_API extern "C"
 #endif
 
-// ----------------- internal helpers -----------------
+// ----------------------------------------------------
+// internal helpers
+// ----------------------------------------------------
 
 static char* MakeReturnString(const std::string& s)
 {
@@ -53,21 +66,90 @@ static char* MakeReturnString(const std::string& s)
 
 static void SetLastError(const std::string& msg)
 {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
 
-    g_lastErrorString = msg;
+        g_lastErrorString = msg;
 
-    const size_t maxLen = sizeof(g_lastErrorBuffer) - 1;
-    const size_t len    = (msg.size() < maxLen) ? msg.size() : maxLen;
+        const size_t maxLen = sizeof(g_lastErrorBuffer) - 1;
+        const size_t len    = (msg.size() < maxLen) ? msg.size() : maxLen;
 
-    std::memcpy(g_lastErrorBuffer, msg.c_str(), len);
-    g_lastErrorBuffer[len] = '\0';
+        std::memcpy(g_lastErrorBuffer, msg.c_str(), len);
+        g_lastErrorBuffer[len] = '\0';
+    }
 
-    // Also log to stdout for container logs
-    std::cout << "[GSDKWRAP ERROR] " << g_lastErrorBuffer << std::endl;
+    std::cout << "[GSDKWRAP ERROR] " << msg << std::endl;
+
+    // also push as event
+    std::lock_guard<std::mutex> lk(g_eventsMutex);
+    if (g_events.size() >= GSDK_MAX_EVENTS)
+        g_events.pop_front();
+
+    std::string ev = "{\"type\":\"error\",\"message\":\"";
+    for (char c : msg)
+    {
+        switch (c)
+        {
+            case '\\': ev += "\\\\"; break;
+            case '"':  ev += "\\\""; break;
+            case '\n': ev += "\\n";  break;
+            case '\r': ev += "\\r";  break;
+            case '\t': ev += "\\t";  break;
+            default:   ev += c;      break;
+        }
+    }
+    ev += "\"}";
+    g_events.push_back(ev);
 }
 
-// Helper to get config key, now returning char*
+static void PushEvent(const std::string& json)
+{
+    std::lock_guard<std::mutex> lk(g_eventsMutex);
+
+    if (g_events.size() >= GSDK_MAX_EVENTS)
+        g_events.pop_front();
+
+    g_events.push_back(json);
+}
+
+static std::string JsonEscape(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size() + 16);
+
+    for (char c : s)
+    {
+        switch (c)
+        {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += c;      break;
+        }
+    }
+
+    return out;
+}
+
+static std::string FormatTmJson(const tm& t)
+{
+    char buf[64];
+    std::snprintf(
+        buf,
+        sizeof(buf),
+        "%04d-%02d-%02d %02d:%02d:%02d",
+        t.tm_year + 1900,
+        t.tm_mon + 1,
+        t.tm_mday,
+        t.tm_hour,
+        t.tm_min,
+        t.tm_sec
+    );
+    return std::string(buf);
+}
+
 static char* GetConfigKey(const char* key)
 {
     if (!key)
@@ -104,13 +186,19 @@ static char* GetConfigKey(const char* key)
     }
 }
 
-// ----------------- exported API -----------------
+// ----------------------------------------------------
+// exported API
+// ----------------------------------------------------
+GSDKWRAP_API double gsdk_test()
+{
+	return 1993;
+}
 
 GSDKWRAP_API double gsdk_start(double debugLogs)
 {
-	std::cout << "gsdk_start CALLED: " << debugLogs << std::endl;
-	
-    if (g_started)
+    std::cout << "gsdk_start CALLED: " << debugLogs << std::endl;
+
+    if (g_started.load())
     {
         std::cout << "GSDK already started" << std::endl;
         return 1.0;
@@ -118,23 +206,33 @@ GSDKWRAP_API double gsdk_start(double debugLogs)
 
     try
     {
+        g_healthy.store(true);
+        g_shutdownRequested.store(false);
+
         GSDK::registerHealthCallback([]() -> bool {
-            std::cout << "GSDK health callback" << std::endl;
-            return g_healthy;
+            return g_healthy.load();
         });
 
         GSDK::registerShutdownCallback([]() {
             std::cout << "GSDK shutdown callback" << std::endl;
-            g_healthy = false;
+            g_shutdownRequested.store(true);
+            g_healthy.store(false);
+            PushEvent("{\"type\":\"shutdown\"}");
         });
 
-        GSDK::registerMaintenanceCallback([](const tm&) {
+        GSDK::registerMaintenanceCallback([](const tm& when) {
             std::cout << "GSDK maintenance callback" << std::endl;
+
+            std::string timeStr = FormatTmJson(when);
+            std::string ev = "{\"type\":\"maintenance\",\"scheduled\":\"" + JsonEscape(timeStr) + "\"}";
+            PushEvent(ev);
         });
 
         GSDK::start(debugLogs != 0);
 
-        g_started = true;
+        g_started.store(true);
+        PushEvent("{\"type\":\"started\"}");
+
         std::cout << "GSDK::start OK" << std::endl;
         return 1.0;
     }
@@ -161,12 +259,18 @@ GSDKWRAP_API double gsdk_start(double debugLogs)
 
 GSDKWRAP_API double gsdk_ready_for_players()
 {
-    std::cout << "gsdk_ready CALLED" << std::endl;
+    std::cout << "gsdk_ready_for_players CALLED" << std::endl;
 
     try
     {
         bool allocated = GSDK::readyForPlayers();
         std::cout << "readyForPlayers returned " << allocated << std::endl;
+
+        if (allocated)
+            PushEvent("{\"type\":\"ready\",\"allocated\":true}");
+        else
+            PushEvent("{\"type\":\"ready\",\"allocated\":false}");
+
         return allocated ? 1.0 : 0.0;
     }
     catch (const std::exception& ex)
@@ -183,14 +287,74 @@ GSDKWRAP_API double gsdk_ready_for_players()
     }
 }
 
-// ----------------- string-returning API (now char*) -----------------
+// ----------------------------------------------------
+// event polling
+// ----------------------------------------------------
+
+GSDKWRAP_API double gsdk_event_count()
+{
+    std::lock_guard<std::mutex> lk(g_eventsMutex);
+    return static_cast<double>(g_events.size());
+}
+
+GSDKWRAP_API char* gsdk_poll_event()
+{
+    std::lock_guard<std::mutex> lk(g_eventsMutex);
+
+    if (g_events.empty())
+        return nullptr;
+
+    std::string ev = g_events.front();
+    g_events.pop_front();
+
+    return MakeReturnString(ev);
+}
+
+GSDKWRAP_API double gsdk_clear_events()
+{
+    std::lock_guard<std::mutex> lk(g_eventsMutex);
+    double count = static_cast<double>(g_events.size());
+    g_events.clear();
+    return count;
+}
+
+// ----------------------------------------------------
+// state helpers
+// ----------------------------------------------------
+
+GSDKWRAP_API double gsdk_is_started()
+{
+    return g_started.load() ? 1.0 : 0.0;
+}
+
+GSDKWRAP_API double gsdk_is_healthy()
+{
+    return g_healthy.load() ? 1.0 : 0.0;
+}
+
+GSDKWRAP_API double gsdk_has_pending_shutdown()
+{
+    return g_shutdownRequested.load() ? 1.0 : 0.0;
+}
+
+GSDKWRAP_API double gsdk_set_healthy(double healthy)
+{
+    g_healthy.store(healthy != 0.0);
+    return g_healthy.load() ? 1.0 : 0.0;
+}
+
+// ----------------------------------------------------
+// string-returning API
+// ----------------------------------------------------
 
 GSDKWRAP_API char* gsdk_get_config_value(const char* key)
 {
     return GetConfigKey(key);
 }
 
-// ----------------- extra helpers: config keys -----------------
+// ----------------------------------------------------
+// extra helpers: config keys
+// ----------------------------------------------------
 
 GSDKWRAP_API char* gsdk_get_title_id()
 {
@@ -237,7 +401,9 @@ GSDKWRAP_API char* gsdk_get_session_cookie()
     return GetConfigKey(GSDK::SESSION_COOKIE_KEY);
 }
 
-// ----------------- directories & logging -----------------
+// ----------------------------------------------------
+// directories & logging
+// ----------------------------------------------------
 
 GSDKWRAP_API char* gsdk_get_logs_directory()
 {
@@ -279,7 +445,6 @@ GSDKWRAP_API char* gsdk_get_shared_content_directory()
     }
 }
 
-// return the GSDK logMessage ID as double
 GSDKWRAP_API double gsdk_log_message(const char* msg)
 {
     if (!msg)
@@ -307,9 +472,10 @@ GSDKWRAP_API double gsdk_log_message(const char* msg)
     }
 }
 
-// ----------------- initial players -----------------
+// ----------------------------------------------------
+// initial players
+// ----------------------------------------------------
 
-// How many initial players are assigned (after allocation)
 GSDKWRAP_API double gsdk_get_initial_player_count()
 {
     try
@@ -331,7 +497,6 @@ GSDKWRAP_API double gsdk_get_initial_player_count()
     }
 }
 
-// Get player ID by index [0..count-1]
 GSDKWRAP_API char* gsdk_get_initial_player(double index)
 {
     try
@@ -367,13 +532,10 @@ GSDKWRAP_API char* gsdk_get_initial_player(double index)
     }
 }
 
-// ----------------- update connected players -----------------
-//
-// idsCsv:
-//   - nullptr or ""  -> clears all connected players
-//   - "p1"           -> one player
-//   - "p1,p2,p3"     -> multiple players
-//
+// ----------------------------------------------------
+// update connected players
+// ----------------------------------------------------
+
 GSDKWRAP_API double gsdk_update_connected_players(const char* idsCsv)
 {
     try
@@ -388,7 +550,6 @@ GSDKWRAP_API double gsdk_update_connected_players(const char* idsCsv)
 
             while (std::getline(ss, token, ','))
             {
-                // remove simple spaces around id
                 size_t start = token.find_first_not_of(" \t\r\n");
                 size_t end   = token.find_last_not_of(" \t\r\n");
                 if (start == std::string::npos || end == std::string::npos)
@@ -396,14 +557,19 @@ GSDKWRAP_API double gsdk_update_connected_players(const char* idsCsv)
 
                 std::string id = token.substr(start, end - start + 1);
                 if (!id.empty())
-                {
-                    players.emplace_back(id); // ConnectedPlayer(std::string)
-                }
+                    players.emplace_back(id);
             }
         }
 
         GSDK::updateConnectedPlayers(players);
+
         std::cout << "gsdk_update_connected_players: count=" << players.size() << std::endl;
+
+        {
+            std::ostringstream oss;
+            oss << "{\"type\":\"connected_players_updated\",\"count\":" << players.size() << "}";
+            PushEvent(oss.str());
+        }
 
         return static_cast<double>(players.size());
     }
@@ -427,12 +593,13 @@ GSDKWRAP_API double gsdk_end_session()
     {
         std::cout << "gsdk_end_session CALLED" << std::endl;
 
-        // Clear connected players
         std::vector<ConnectedPlayer> emptyList;
         GSDK::updateConnectedPlayers(emptyList);
 
-        // Mark unhealthy so health callback starts failing
-        g_healthy = false;
+        g_healthy.store(false);
+        g_shutdownRequested.store(true);
+
+        PushEvent("{\"type\":\"session_ended\"}");
 
         std::cout << "gsdk_end_session: cleared players and marked unhealthy" << std::endl;
         return 1.0;
@@ -451,11 +618,10 @@ GSDKWRAP_API double gsdk_end_session()
     }
 }
 
-// ----------------- last error access -----------------
+// ----------------------------------------------------
+// last error access
+// ----------------------------------------------------
 
-// Returns the last error message as a char* from a global buffer.
-// - nullptr if no error has been recorded yet.
-// - Value is valid until the next error, like the other string returns.
 GSDKWRAP_API char* gsdk_get_last_error()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -464,4 +630,14 @@ GSDKWRAP_API char* gsdk_get_last_error()
         return nullptr;
 
     return g_lastErrorBuffer;
+}
+
+GSDKWRAP_API double gsdk_clear_last_error()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    g_lastErrorString.clear();
+    g_lastErrorBuffer[0] = '\0';
+
+    return 1.0;
 }
